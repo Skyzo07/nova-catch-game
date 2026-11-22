@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>NOVA CATCH — a 60-second arcade catcher</title>
+<style>
+  html,body{margin:0;padding:0;height:100%;background:#050514;overflow:hidden}
+  canvas{display:block;touch-action:none}
+  #hint{position:fixed;left:0;right:0;bottom:8px;text-align:center;color:#8fa3ff;
+    font:13px/1.4 system-ui,sans-serif;opacity:.7;pointer-events:none}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="hint">Move: &larr; &rarr; / A D / mouse / touch &nbsp;·&nbsp; Space to start</div>
+<script>
+'use strict';
+/* NOVA CATCH — a 60-second arcade catcher.
+   Built from one prompt. One HTML file, plain Canvas 2D, no libraries, no network.
+   Pilot a little ship along the bottom, catch falling stars, dodge meteors,
+   grab golden comets for bonus. Three lives, speed ramps up, 60 seconds. */
+const cv = document.getElementById('game');
+const ctx = cv.getContext('2d');
+const qs = new URLSearchParams(location.search);
+const DEMO = qs.get('demo') === '1';
+const SHOT = qs.get('shot') || '';
+const W = 540, H = 960;           // logical playfield
+let scale = 1, ox = 0, oy = 0, dpr = 1, booted = false;
+
+function resize() {
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  cv.width = innerWidth * dpr; cv.height = innerHeight * dpr;
+  cv.style.width = innerWidth + 'px'; cv.style.height = innerHeight + 'px';
+  scale = Math.min(cv.width / W, cv.height / H);
+  ox = (cv.width - W * scale) / 2; oy = (cv.height - H * scale) / 2;
+  // Reassigning canvas.width clears it; a late viewport-settle resize would
+  // otherwise wipe a frozen ?shot= frame, so repaint it.
+  if (booted && SHOT) draw(1.2);
+}
+addEventListener('resize', resize); resize();
+
+/* Deterministic RNG for demo / screenshots, Math.random otherwise. */
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const rnd = (DEMO || SHOT) ? mulberry32(1337) : Math.random;
+
+/* ---------- audio: tiny WebAudio blips, no files ---------- */
+let AC = null;
+function audio() {
+  if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { AC = null; } }
+  return AC;
+}
+function blip(f0, f1, dur, type, vol) {
+  if (DEMO || SHOT) return;                 // headless capture stays silent
+  const ac = audio(); if (!ac) return;
+  const o = ac.createOscillator(), g = ac.createGain();
+  o.type = type || 'sine';
+  o.frequency.setValueAtTime(f0, ac.currentTime);
+  o.frequency.exponentialRampToValueAtTime(Math.max(f1, 1), ac.currentTime + dur);
+  g.gain.setValueAtTime(vol || 0.12, ac.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.001, ac.currentTime + dur);
+  o.connect(g).connect(ac.destination);
+  o.start(); o.stop(ac.currentTime + dur + 0.02);
+}
+const sCatch = () => { blip(660, 990, 0.09, 'sine', 0.14); };
+const sComet = () => { blip(520, 520, 0.07, 'triangle', 0.14); setTimeout(() => blip(780, 780, 0.07, 'triangle', 0.14), 60); setTimeout(() => blip(1040, 1320, 0.12, 'triangle', 0.14), 120); };
+const sHit = () => { blip(220, 55, 0.28, 'sawtooth', 0.2); };
+const sOver = () => { [392, 311, 262, 196].forEach((f, i) => setTimeout(() => blip(f, f, 0.22, 'triangle', 0.15), i * 170)); };
+
+/* ---------- state ---------- */
+const BEST_KEY = 'novacatch-best';
+let state = 'title';            // title | playing | over
+let score = 0, lives = 3, timeLeft = 60, best = 0;
+try { best = +localStorage.getItem(BEST_KEY) || 0; } catch (e) { best = 0; }
+let ship = { x: W / 2, y: 878, w: 64, h: 30, tx: W / 2, tilt: 0 };
+let ents = [];                  // {kind:'star'|'comet'|'meteor', x,y,vy,r,rot,vr}
+let parts = [];                 // particles {x,y,vx,vy,life,max,color,size}
+let stars3d = [];               // background starfield
+for (let i = 0; i < 90; i++) stars3d.push({ x: rnd() * W, y: rnd() * H, z: 0.3 + rnd() * 0.7, tw: rnd() * 6.28 });
+let spawnT = 0, elapsed = 0, shake = 0, flash = 0, overT = 0, startT = 0;
+let keys = {};
+
+function reset() {
+  score = 0; lives = 3; timeLeft = 60; elapsed = 0; spawnT = 0;
+  ents = []; parts = []; shake = 0; flash = 0;
+  ship.x = ship.tx = W / 2; ship.tilt = 0;
+}
+function startGame() {
+  reset(); state = 'playing'; startT = performance.now();
+  document.getElementById('hint').style.display = 'none';
+  if (!DEMO) blip(440, 880, 0.15, 'triangle', 0.14);
+}
+function gameOver() {
+  state = 'over'; overT = 0;
+  if (score > best) { best = score; try { localStorage.setItem(BEST_KEY, String(best)); } catch (e) {} }
+  sOver();
+}
+
+/* ---------- spawning & difficulty ---------- */
+function spawn() {
+  const r = rnd();
+  const kind = r < 0.68 ? 'star' : (r < 0.90 ? 'meteor' : 'comet');
+  const speedBase = 150 + elapsed * 4.2;              // ramps up over the 60 s
+  const e = {
+    kind,
+    x: 30 + rnd() * (W - 60),
+    y: -30,
+    vy: speedBase * (kind === 'comet' ? 1.7 : 1) * (0.85 + rnd() * 0.4),
+    r: kind === 'meteor' ? 20 + rnd() * 8 : (kind === 'comet' ? 13 : 12),
+    rot: rnd() * 6.28, vr: (rnd() - 0.5) * 2.4,
+    hue: kind === 'star' ? 48 : (kind === 'comet' ? 42 : 0)
+  };
+  ents.push(e);
+}
+function burst(x, y, color, n, pow) {
+  for (let i = 0; i < n; i++) {
+    const a = rnd() * 6.28, s = (0.4 + rnd() * 0.6) * (pow || 160);
+    parts.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s - 40, life: 0.5 + rnd() * 0.5, max: 1, color, size: 2 + rnd() * 3.5 });
+  }
+}
+
+/* ---------- input ---------- */
+addEventListener('keydown', e => {
+  keys[e.key] = true;
+  if (e.key === ' ' || e.key === 'Enter') {
+    e.preventDefault();
+    if (state === 'title' || state === 'over') startGame();
+  }
+  if ((e.key === 'r' || e.key === 'R') && state === 'over') startGame();
+  if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key)) e.preventDefault();
+});
+addEventListener('keyup', e => { keys[e.key] = false; });
+function pointerX(clientX) {
+  const rect = cv.getBoundingClientRect();
+  return (clientX - rect.left) / rect.width * W;
+}
+cv.addEventListener('pointermove', e => { if (state === 'playing') ship.tx = pointerX(e.clientX); });
+cv.addEventListener('pointerdown', e => {
+  audio();
+  if (state === 'title' || state === 'over') { startGame(); return; }
+  ship.tx = pointerX(e.clientX);
+});
+
+/* ---------- demo autopilot: chase stars, dodge meteors ---------- */
+function autopilot(dt) {
+  let target = null, bestD = 1e9;
+  for (const e of ents) {
+    if (e.kind === 'meteor') continue;
+    const d = (ship.y - e.y) + Math.abs(e.x - ship.x) * 0.6;
+    if (d < bestD) { bestD = d; target = e; }
+  }
+  let tx = target ? target.x : W / 2;
+  for (const e of ents) {                    // dodge a meteor right above the ship
+    if (e.kind !== 'meteor') continue;
+    if (e.y > ship.y - 190 && e.y < ship.y && Math.abs(e.x - ship.x) < 56) {
+      tx = ship.x + (e.x < ship.x ? 90 : -90);
+    }
+  }
+  ship.tx = Math.max(34, Math.min(W - 34, tx));
+  const sp = 620 * dt;
+  ship.x += Math.max(-sp, Math.min(sp, ship.tx - ship.x));
+}
+
+/* ---------- update ---------- */
+function update(dt) {
+  elapsed += dt;
+  timeLeft = Math.max(0, 60 - elapsed);
+  if (timeLeft <= 0) { gameOver(); return; }
+  // keyboard
+  const kSpeed = 460 * dt;
+  if (keys['ArrowLeft'] || keys['a'] || keys['A']) ship.tx -= kSpeed;
+  if (keys['ArrowRight'] || keys['d'] || keys['D']) ship.tx += kSpeed;
+  ship.tx = Math.max(34, Math.min(W - 34, ship.tx));
+  if (DEMO) autopilot(dt);
+  else {
+    const dx = ship.tx - ship.x;
+    ship.x += Math.max(-560 * dt, Math.min(560 * dt, dx));
+  }
+  ship.tilt = Math.max(-0.3, Math.min(0.3, (ship.tx - ship.x) * 0.004));
+  // spawn
+  spawnT -= dt;
+  if (spawnT <= 0) { spawn(); spawnT = Math.max(0.30, 0.85 - elapsed * 0.009) * (0.7 + rnd() * 0.6); }
+  // entities
+  for (let i = ents.length - 1; i >= 0; i--) {
+    const e = ents[i];
+    e.y += e.vy * dt; e.rot += e.vr * dt;
+    if (e.y > H + 40) { ents.splice(i, 1); continue; }
+    const dx = e.x - ship.x, dy = e.y - ship.y;
+    if (Math.abs(dx) < ship.w / 2 + e.r * 0.6 && Math.abs(dy) < 26 + e.r * 0.6) {
+      if (e.kind === 'star') { score += 10; burst(e.x, e.y, '#ffd94a', 14, 170); sCatch(); }
+      else if (e.kind === 'comet') { score += 50; burst(e.x, e.y, '#7df9ff', 26, 260); sComet(); }
+      else {
+        lives--; shake = 14; flash = 0.35; burst(e.x, e.y, '#ff5a4e', 26, 260); sHit();
+        if (lives <= 0) { ents.splice(i, 1); gameOver(); return; }
+      }
+      ents.splice(i, 1);
+    }
+  }
+  // particles
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p = parts[i];
+    p.life -= dt; p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 220 * dt;
+    if (p.life <= 0) parts.splice(i, 1);
+  }
+  if (shake > 0) shake = Math.max(0, shake - dt * 30);
+  if (flash > 0) flash = Math.max(0, flash - dt * 1.4);
+}
+
+/* ---------- draw ---------- */
+function rr(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+}
+function drawStar(x, y, r, color, rot) {
+  ctx.save(); ctx.translate(x, y); ctx.rotate(rot);
+  ctx.fillStyle = color; ctx.beginPath();
+  for (let i = 0; i < 10; i++) {
+    const a = i * Math.PI / 5 - Math.PI / 2, rad = i % 2 === 0 ? r : r * 0.45;
+    i === 0 ? ctx.moveTo(Math.cos(a) * rad, Math.sin(a) * rad) : ctx.lineTo(Math.cos(a) * rad, Math.sin(a) * rad);
+  }
+  ctx.closePath(); ctx.fill(); ctx.restore();
+}
+function drawBackground(t) {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#070726'); g.addColorStop(0.55, '#0d0d3d'); g.addColorStop(1, '#1a0b3d');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  // nebula blobs
+  ctx.globalAlpha = 0.16;
+  ctx.fillStyle = '#b04dff';
+  ctx.beginPath(); ctx.arc(90, 210, 130, 0, 6.29); ctx.fill();
+  ctx.fillStyle = '#2ec8ff';
+  ctx.beginPath(); ctx.arc(470, 480, 110, 0, 6.29); ctx.fill();
+  ctx.fillStyle = '#ff5aa0';
+  ctx.beginPath(); ctx.arc(140, 700, 90, 0, 6.29); ctx.fill();
+  ctx.globalAlpha = 1;
+  // twinkling starfield
+  for (const s of stars3d) {
+    ctx.globalAlpha = 0.35 + 0.4 * Math.abs(Math.sin(t * s.z + s.tw));
+    ctx.fillStyle = '#cfe4ff';
+    ctx.fillRect(s.x, (s.y + t * 12 * s.z) % H, s.z * 2.2, s.z * 2.2);
+  }
+  ctx.globalAlpha = 1;
+}
+function drawShip() {
+  ctx.save(); ctx.translate(ship.x, ship.y); ctx.rotate(ship.tilt);
+  // engine flame
+  const fl = 12 + Math.sin(performance.now() / 40) * 5;
+  const fg = ctx.createLinearGradient(0, 12, 0, 12 + fl + 14);
+  fg.addColorStop(0, '#ffe27a'); fg.addColorStop(1, 'rgba(255,90,40,0)');
+  ctx.fillStyle = fg;
+  ctx.beginPath(); ctx.moveTo(-8, 12); ctx.lineTo(0, 12 + fl + 12); ctx.lineTo(8, 12); ctx.closePath(); ctx.fill();
+  // hull
+  const hg = ctx.createLinearGradient(0, -18, 0, 14);
+  hg.addColorStop(0, '#8fe8ff'); hg.addColorStop(0.5, '#3d7bff'); hg.addColorStop(1, '#1c2f7a');
+  ctx.fillStyle = hg;
+  ctx.beginPath(); ctx.moveTo(0, -20); ctx.lineTo(24, 10); ctx.lineTo(10, 14); ctx.lineTo(-10, 14); ctx.lineTo(-24, 10); ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = 'rgba(190,235,255,.9)'; ctx.lineWidth = 1.5; ctx.stroke();
+  // cockpit + wings
+  ctx.fillStyle = '#eafcff'; ctx.beginPath(); ctx.arc(0, -4, 6, 0, 6.29); ctx.fill();
+  ctx.fillStyle = '#ff5a7a'; ctx.beginPath(); ctx.moveTo(-24, 10); ctx.lineTo(-32, 16); ctx.lineTo(-14, 14); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(24, 10); ctx.lineTo(32, 16); ctx.lineTo(14, 14); ctx.closePath(); ctx.fill();
+  ctx.restore();
+}
+function drawEnt(e) {
+  if (e.kind === 'star') {
+    ctx.shadowColor = '#ffd94a'; ctx.shadowBlur = 14;
+    drawStar(e.x, e.y, e.r, '#ffd94a', e.rot);
+    ctx.shadowBlur = 0;
+  } else if (e.kind === 'comet') {
+    ctx.strokeStyle = 'rgba(125,249,255,.75)'; ctx.lineWidth = 4; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(e.x, e.y - 26); ctx.lineTo(e.x, e.y - 52); ctx.stroke();
+    ctx.shadowColor = '#7df9ff'; ctx.shadowBlur = 18;
+    ctx.fillStyle = '#fff6c9'; ctx.beginPath(); ctx.arc(e.x, e.y, e.r, 0, 6.29); ctx.fill();
+    ctx.fillStyle = '#ffb52e'; ctx.beginPath(); ctx.arc(e.x, e.y, e.r * 0.55, 0, 6.29); ctx.fill();
+    ctx.shadowBlur = 0;
+  } else {
+    ctx.save(); ctx.translate(e.x, e.y); ctx.rotate(e.rot);
+    ctx.fillStyle = '#6b6f7d';
+    ctx.beginPath();
+    for (let i = 0; i < 8; i++) {
+      const a = i / 8 * 6.28, rad = e.r * (0.8 + ((i * 37) % 10) / 28);
+      i === 0 ? ctx.moveTo(Math.cos(a) * rad, Math.sin(a) * rad) : ctx.lineTo(Math.cos(a) * rad, Math.sin(a) * rad);
+    }
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle = '#ff5a4e';
+    ctx.beginPath(); ctx.arc(-e.r * 0.3, -e.r * 0.2, e.r * 0.22, 0, 6.29); ctx.fill();
+    ctx.beginPath(); ctx.arc(e.r * 0.35, e.r * 0.3, e.r * 0.16, 0, 6.29); ctx.fill();
+    ctx.restore();
+  }
+}
+function drawHUD() {
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillStyle = '#ffffff'; ctx.font = '700 30px system-ui, sans-serif'; ctx.textAlign = 'left';
+  ctx.fillText('SCORE ' + score, 16, 44);
+  ctx.textAlign = 'right'; ctx.font = '600 20px system-ui, sans-serif'; ctx.fillStyle = '#9fb4ff';
+  ctx.fillText('BEST ' + best, W - 16, 40);
+  // lives as hearts
+  ctx.textAlign = 'center'; ctx.font = '26px system-ui, sans-serif';
+  for (let i = 0; i < 3; i++) {
+    ctx.fillStyle = i < lives ? '#ff5a7a' : 'rgba(255,255,255,.18)';
+    ctx.fillText('♥', W / 2 + (i - 1) * 34, 42);
+  }
+  // time bar
+  const tw = W - 32, frac = timeLeft / 60;
+  ctx.fillStyle = 'rgba(255,255,255,.15)'; rr(16, 58, tw, 10, 5); ctx.fill();
+  ctx.fillStyle = frac > 0.25 ? '#37e08b' : '#ff5a4e';
+  if (frac > 0) { rr(16, 58, tw * frac, 10, 5); ctx.fill(); }
+  ctx.fillStyle = '#ffffff'; ctx.font = '700 20px system-ui, sans-serif'; ctx.textAlign = 'left';
+  ctx.fillText(Math.ceil(timeLeft) + 's', 16, 92);
+}
+function panel(title, lines, accent) {
+  ctx.fillStyle = 'rgba(5,5,30,.72)'; rr(36, 300, W - 72, 360, 22); ctx.fill();
+  ctx.strokeStyle = 'rgba(140,170,255,.5)'; ctx.lineWidth = 2; rr(36, 300, W - 72, 360, 22); ctx.stroke();
+  ctx.textAlign = 'center'; ctx.fillStyle = accent || '#ffd94a';
+  ctx.font = '800 54px system-ui, sans-serif';
+  ctx.fillText(title, W / 2, 392);
+  ctx.fillStyle = '#ffffff'; ctx.font = '600 24px system-ui, sans-serif';
+  lines.forEach((ln, i) => ctx.fillText(ln, W / 2, 452 + i * 38));
+}
+function draw(t) {
+  ctx.save();
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, innerWidth, innerHeight);
+  ctx.translate(ox / dpr, oy / dpr); ctx.scale(scale / dpr, scale / dpr);
+  if (shake > 0) ctx.translate((rnd() - 0.5) * shake, (rnd() - 0.5) * shake);
+  drawBackground(t);
+  for (const e of ents) drawEnt(e);
+  for (const p of parts) {
+    ctx.globalAlpha = Math.max(0, p.life / p.max);
+    ctx.fillStyle = p.color;
+    ctx.fillRect(p.x - p.size / 2, p.y - p.size / 2, p.size, p.size);
+  }
+  ctx.globalAlpha = 1;
+  if (state === 'playing' || state === 'over') drawShip();
+  if (state === 'playing') drawHUD();
+  if (state === 'title') {
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#ffd94a'; ctx.font = '800 64px system-ui, sans-serif';
+    ctx.shadowColor = '#ff9a3d'; ctx.shadowBlur = 26;
+    ctx.fillText('NOVA', W / 2, 330);
+    ctx.fillText('CATCH', W / 2, 400);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = '#ffffff'; ctx.font = '600 22px system-ui, sans-serif';
+    ctx.fillText('60 seconds. Catch stars. Dodge meteors.', W / 2, 458);
+    ctx.fillText('Golden comets = +50 bonus!', W / 2, 492);
+    ctx.fillStyle = '#9fb4ff'; ctx.font = '600 20px system-ui, sans-serif';
+    ctx.fillText('← → / A D / mouse / touch to fly', W / 2, 560);
+    if (SHOT || Math.sin(t * 4) > -0.2) {
+      ctx.fillStyle = '#7df9ff'; ctx.font = '800 26px system-ui, sans-serif';
+      ctx.fillText('PRESS SPACE OR TAP TO START', W / 2, 620);
+    }
+    if (best > 0) { ctx.fillStyle = '#ffd94a'; ctx.font = '700 22px system-ui, sans-serif'; ctx.fillText('BEST ' + best, W / 2, 668); }
+  }
+  if (state === 'over') {
+    panel('GAME OVER', ['Score  ' + score, 'Best  ' + best, score >= best && score > 0 ? '★ New best! ★' : 'Catch more stars next run!'], '#ff5a7a');
+    if (SHOT || Math.sin(t * 4) > -0.2) {
+      ctx.fillStyle = '#7df9ff'; ctx.font = '800 24px system-ui, sans-serif'; ctx.textAlign = 'center';
+      ctx.fillText('PRESS R OR TAP TO PLAY AGAIN', W / 2, 620);
+    }
+  }
+  if (flash > 0) { ctx.fillStyle = 'rgba(255,60,50,' + (flash * 0.5) + ')'; ctx.fillRect(0, 0, W, H); }
+  ctx.restore();
+}
+
+/* ---------- screenshot presets (?shot=title|play|over) ---------- */
+function applyShot() {
+  if (SHOT === 'title') { state = 'title'; }
+  else if (SHOT === 'play') {
+    state = 'playing'; score = 120; lives = 2; timeLeft = 37; elapsed = 23;
+    ents = [
+      { kind: 'star', x: 150, y: 300, vy: 200, r: 12, rot: 0.4, vr: 0.5 },
+      { kind: 'star', x: 330, y: 210, vy: 200, r: 12, rot: 1.2, vr: -0.4 },
+      { kind: 'comet', x: 430, y: 140, vy: 320, r: 13, rot: 0, vr: 0 },
+      { kind: 'meteor', x: 230, y: 420, vy: 220, r: 24, rot: 0.8, vr: 0.7 },
+      { kind: 'star', x: 90, y: 520, vy: 200, r: 12, rot: 2.0, vr: 0.3 },
+      { kind: 'meteor', x: 470, y: 560, vy: 230, r: 22, rot: 2.2, vr: -0.6 }
+    ];
+    burst(270, 700, '#ffd94a', 12, 150);
+    ship.x = ship.tx = 270;
+  } else if (SHOT === 'over') {
+    state = 'over'; score = 340; best = Math.max(best, 340); lives = 0;
+  }
+  draw(1.2);                       // one frozen frame: stable screenshot
+}
+
+/* ---------- main loop ---------- */
+let last = performance.now();
+function frame(now) {
+  const t = now / 1000;
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  if (state === 'playing') update(dt);
+  if (state === 'over') { overT += dt; if (DEMO && overT > 1.2) startGame(); }
+  draw(t);
+  requestAnimationFrame(frame);
+}
+if (SHOT) { booted = true; applyShot(); }
+else {
+  if (DEMO) setTimeout(startGame, 600);   // autoplay: title flashes, then off we go
+  requestAnimationFrame(frame);
+}
+window.__nova = { get state() { return state; }, get score() { return score; } };
+</script>
+</body>
+</html>
